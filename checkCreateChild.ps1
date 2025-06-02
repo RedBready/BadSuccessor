@@ -227,7 +227,7 @@ function Get-UserSids {
     }
 }
 
-# Function to check Create-Child permission on OU
+# Function to check if user has Create-Child permission on an OU
 function Test-CreateChildPermission {
     param(
         [string]$OuDistinguishedName,
@@ -242,26 +242,63 @@ function Test-CreateChildPermission {
         $OuPath = "LDAP://$($DirectoryEntry.Name.Substring(7))/$OuDistinguishedName"
         $OU = New-Object System.DirectoryServices.DirectoryEntry($OuPath, $DirectoryEntry.Username, $DirectoryEntry.Password)
         
-        # Get security descriptor
+        # Test if we can actually read the security descriptor
+        try {
+            $TestAccess = $OU.psbase.ObjectSecurity
+        } catch {
+            Write-DebugInfo "WARNING: Cannot read security descriptor for $OuDistinguishedName - access denied"
+            return $false
+        }
+        
+        # Get security descriptor with both explicit and inherited permissions
         $SecurityDescriptor = $OU.psbase.ObjectSecurity
         $AccessRules = $SecurityDescriptor.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
         
-        Write-DebugInfo "Retrieved $($AccessRules.Count) access rules"
+        Write-DebugInfo "Retrieved $($AccessRules.Count) access rules (including inherited)"
         
+        # First pass: Check for DENY rules that would block access
+        $DenyRules = @()
         foreach ($Rule in $AccessRules) {
-            Write-DebugInfo "Examining rule: $($Rule.IdentityReference) - $($Rule.AccessControlType) - $($Rule.ActiveDirectoryRights)"
+            if ($Rule.AccessControlType -eq "Deny" -and ($UserSids -contains $Rule.IdentityReference)) {
+                $HasCreateChildDeny = ($Rule.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::CreateChild) -ne 0
+                $HasGenericAllDeny = ($Rule.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::GenericAll) -ne 0
+                $HasFullControlDeny = ($Rule.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::FullControl) -ne 0
+                
+                if ($HasCreateChildDeny -or $HasGenericAllDeny -or $HasFullControlDeny) {
+                    Write-DebugInfo "DENY rule found for user - CreateChild access explicitly denied"
+                    return $false
+                }
+            }
+        }
+        
+        # Second pass: Check for ALLOW rules
+        foreach ($Rule in $AccessRules) {
+            Write-DebugInfo "Examining rule: $($Rule.IdentityReference) - $($Rule.AccessControlType) - $($Rule.ActiveDirectoryRights) - Inherited: $($Rule.IsInherited)"
             
-            # Check for Allow rules with CreateChild or GenericAll permissions
+            # Check for Allow rules with permissions that grant CreateChild capability
             if ($Rule.AccessControlType -eq "Allow") {
                 $HasCreateChild = ($Rule.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::CreateChild) -ne 0
                 $HasGenericAll = ($Rule.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::GenericAll) -ne 0
+                $HasFullControl = ($Rule.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::FullControl) -ne 0
+                $HasGenericWrite = ($Rule.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::GenericWrite) -ne 0
                 
-                if ($HasCreateChild -or $HasGenericAll) {
-                    Write-DebugInfo "Rule grants Create-Child or GenericAll permission"
+                # Check for permission modification rights (can grant themselves CreateChild)
+                $HasWriteDacl = ($Rule.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::WriteDacl) -ne 0
+                $HasWriteOwner = ($Rule.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::WriteOwner) -ne 0
+                
+                if ($HasCreateChild -or $HasGenericAll -or $HasFullControl -or $HasGenericWrite -or ($HasWriteDacl -and $HasWriteOwner)) {
+                    $PermissionType = ""
+                    if ($HasGenericAll) { $PermissionType = "GenericAll" }
+                    elseif ($HasFullControl) { $PermissionType = "FullControl" }
+                    elseif ($HasCreateChild) { $PermissionType = "CreateChild" }
+                    elseif ($HasGenericWrite) { $PermissionType = "GenericWrite" }
+                    elseif ($HasWriteDacl -and $HasWriteOwner) { $PermissionType = "WriteDacl+WriteOwner" }
+                    
+                    Write-DebugInfo "Rule grants $PermissionType permission"
                     
                     # Check if this rule applies to our user
                     if ($UserSids -contains $Rule.IdentityReference) {
-                        Write-DebugInfo "MATCH: User has Create-Child permission via $($Rule.IdentityReference)"
+                        Write-DebugInfo "MATCH: User has CreateChild capability via $PermissionType on $($Rule.IdentityReference)"
                         return $true
                     }
                 }
@@ -293,38 +330,86 @@ function Get-CreateChildUsers {
         $OuPath = "LDAP://$($DirectoryEntry.Name.Substring(7))/$OuDistinguishedName"
         $OU = New-Object System.DirectoryServices.DirectoryEntry($OuPath, $DirectoryEntry.Username, $DirectoryEntry.Password)
         
-        # Get security descriptor
+        # Test if we can actually read the security descriptor
+        try {
+            $TestAccess = $OU.psbase.ObjectSecurity
+        } catch {
+            Write-DebugInfo "WARNING: Cannot read security descriptor for $OuDistinguishedName - access denied"
+            return @()
+        }
+        
+        # Get security descriptor with both explicit and inherited permissions
         $SecurityDescriptor = $OU.psbase.ObjectSecurity
         $AccessRules = $SecurityDescriptor.GetAccessRules($true, $true, [System.Security.Principal.SecurityIdentifier])
         
-        Write-DebugInfo "Retrieved $($AccessRules.Count) access rules"
+        Write-DebugInfo "Retrieved $($AccessRules.Count) access rules (including inherited)"
+        
+        # Collect DENY rules to check against later
+        $DenyRules = @()
+        foreach ($Rule in $AccessRules) {
+            if ($Rule.AccessControlType -eq "Deny") {
+                $HasCreateChildDeny = ($Rule.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::CreateChild) -ne 0
+                $HasGenericAllDeny = ($Rule.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::GenericAll) -ne 0
+                $HasFullControlDeny = ($Rule.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::FullControl) -ne 0
+                
+                if ($HasCreateChildDeny -or $HasGenericAllDeny -or $HasFullControlDeny) {
+                    $DenyRules += $Rule
+                    Write-DebugInfo "Found DENY rule for $($Rule.IdentityReference)"
+                }
+            }
+        }
         
         foreach ($Rule in $AccessRules) {
-            # Check for Allow rules with CreateChild or GenericAll permissions
+            # Check for Allow rules with permissions that grant CreateChild capability
             if ($Rule.AccessControlType -eq "Allow") {
                 $HasCreateChild = ($Rule.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::CreateChild) -ne 0
                 $HasGenericAll = ($Rule.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::GenericAll) -ne 0
+                $HasFullControl = ($Rule.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::FullControl) -ne 0
+                $HasGenericWrite = ($Rule.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::GenericWrite) -ne 0
                 
-                if ($HasCreateChild -or $HasGenericAll) {
-                    $PermissionType = if ($HasGenericAll) { "GenericAll" } else { "CreateChild" }
+                # Check for permission modification rights (can grant themselves CreateChild)
+                $HasWriteDacl = ($Rule.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::WriteDacl) -ne 0
+                $HasWriteOwner = ($Rule.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::WriteOwner) -ne 0
+                
+                if ($HasCreateChild -or $HasGenericAll -or $HasFullControl -or $HasGenericWrite -or ($HasWriteDacl -and $HasWriteOwner)) {
+                    # Determine the most specific permission type
+                    $PermissionType = ""
+                    if ($HasGenericAll) { $PermissionType = "GenericAll" }
+                    elseif ($HasFullControl) { $PermissionType = "FullControl" }
+                    elseif ($HasCreateChild) { $PermissionType = "CreateChild" }
+                    elseif ($HasGenericWrite) { $PermissionType = "GenericWrite" }
+                    elseif ($HasWriteDacl -and $HasWriteOwner) { $PermissionType = "WriteDacl+WriteOwner" }
                     
                     Write-DebugInfo "Found $PermissionType permission for SID: $($Rule.IdentityReference)"
                     
-                    # Try to resolve SID to name
-                    $ResolvedName = "Unknown"
-                    try {
-                        $ResolvedName = $Rule.IdentityReference.Translate([System.Security.Principal.NTAccount]).Value
-                        Write-DebugInfo "Resolved to: $ResolvedName"
-                    } catch {
-                        Write-DebugInfo "Could not resolve SID $($Rule.IdentityReference) to name"
-                        $ResolvedName = $Rule.IdentityReference.Value
+                    # Check if this permission is overridden by a DENY rule
+                    $IsDenied = $false
+                    foreach ($DenyRule in $DenyRules) {
+                        if ($DenyRule.IdentityReference -eq $Rule.IdentityReference) {
+                            Write-DebugInfo "Permission overridden by DENY rule for $($Rule.IdentityReference)"
+                            $IsDenied = $true
+                            break
+                        }
                     }
                     
-                    $CreateChildUsers += [PSCustomObject]@{
-                        Identity = $ResolvedName
-                        SID = $Rule.IdentityReference.Value
-                        Permission = $PermissionType
-                        OU = $OuDistinguishedName
+                    if (-not $IsDenied) {
+                        # Try to resolve SID to name
+                        $ResolvedName = "Unknown"
+                        try {
+                            $ResolvedName = $Rule.IdentityReference.Translate([System.Security.Principal.NTAccount]).Value
+                            Write-DebugInfo "Resolved to: $ResolvedName"
+                        } catch {
+                            Write-DebugInfo "Could not resolve SID $($Rule.IdentityReference) to name"
+                            $ResolvedName = $Rule.IdentityReference.Value
+                        }
+                        
+                        $CreateChildUsers += [PSCustomObject]@{
+                            Identity = $ResolvedName
+                            SID = $Rule.IdentityReference.Value
+                            Permission = $PermissionType
+                            OU = $OuDistinguishedName
+                            IsInherited = $Rule.IsInherited
+                        }
                     }
                 }
             }
@@ -433,6 +518,8 @@ try {
         
         # Display enumeration results
         Write-Host "`n[*] Completed enumeration of $($OuResults.Count) OU(s) in $Domain" -ForegroundColor Cyan
+        Write-Host "[!] Note: Results limited to OUs where security descriptors are readable by current user" -ForegroundColor Yellow
+        Write-Host "[!] Additional permissions may exist via: Extended rights, Delegation, or restricted security descriptors" -ForegroundColor Yellow
         
         if ($AllCreateChildUsers.Count -gt 0) {
             Write-Host "`n[+] Found $($AllCreateChildUsers.Count) CreateChild permission(s) across all OUs:" -ForegroundColor Green
