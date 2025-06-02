@@ -302,6 +302,22 @@ function Test-CreateChildPermission {
                         return $true
                     }
                 }
+                
+                # Check for object-specific CreateChild extended rights
+                if ($Rule -is [System.Security.AccessControl.ObjectAccessRule]) {
+                    $ObjectRule = [System.Security.AccessControl.ObjectAccessRule]$Rule
+                    if ($ObjectRule.ObjectType -ne [System.Guid]::Empty) {
+                        $ObjectTypeGuid = $ObjectRule.ObjectType.ToString().ToLower()
+                        if ($ADObjectTypes.ContainsKey($ObjectTypeGuid)) {
+                            $HasObjectCreateChild = ($Rule.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::CreateChild) -ne 0
+                            if ($HasObjectCreateChild -and ($UserSids -contains $Rule.IdentityReference)) {
+                                $ObjectTypeName = $ADObjectTypes[$ObjectTypeGuid]
+                                Write-DebugInfo "MATCH: User has CreateChild permission for $ObjectTypeName objects via $($Rule.IdentityReference)"
+                                return $true
+                            }
+                        }
+                    }
+                }
             }
         }
         
@@ -412,6 +428,51 @@ function Get-CreateChildUsers {
                         }
                     }
                 }
+                
+                # Check for object-specific CreateChild extended rights
+                if ($Rule -is [System.Security.AccessControl.ObjectAccessRule]) {
+                    $ObjectRule = [System.Security.AccessControl.ObjectAccessRule]$Rule
+                    if ($ObjectRule.ObjectType -ne [System.Guid]::Empty) {
+                        $ObjectTypeGuid = $ObjectRule.ObjectType.ToString().ToLower()
+                        if ($ADObjectTypes.ContainsKey($ObjectTypeGuid)) {
+                            $HasObjectCreateChild = ($Rule.ActiveDirectoryRights -band [System.DirectoryServices.ActiveDirectoryRights]::CreateChild) -ne 0
+                            if ($HasObjectCreateChild) {
+                                $ObjectTypeName = $ADObjectTypes[$ObjectTypeGuid]
+                                Write-DebugInfo "Found CreateChild permission for $ObjectTypeName objects: $($Rule.IdentityReference)"
+                                
+                                # Check if this permission is overridden by a DENY rule
+                                $IsDenied = $false
+                                foreach ($DenyRule in $DenyRules) {
+                                    if ($DenyRule.IdentityReference -eq $Rule.IdentityReference) {
+                                        Write-DebugInfo "Permission overridden by DENY rule for $($Rule.IdentityReference)"
+                                        $IsDenied = $true
+                                        break
+                                    }
+                                }
+                                
+                                if (-not $IsDenied) {
+                                    # Try to resolve SID to name
+                                    $ResolvedName = "Unknown"
+                                    try {
+                                        $ResolvedName = $Rule.IdentityReference.Translate([System.Security.Principal.NTAccount]).Value
+                                        Write-DebugInfo "Resolved to: $ResolvedName"
+                                    } catch {
+                                        Write-DebugInfo "Could not resolve SID $($Rule.IdentityReference) to name"
+                                        $ResolvedName = $Rule.IdentityReference.Value
+                                    }
+                                    
+                                    $CreateChildUsers += [PSCustomObject]@{
+                                        Identity = $ResolvedName
+                                        SID = $Rule.IdentityReference.Value
+                                        Permission = "CreateChild-$ObjectTypeName"
+                                        OU = $OuDistinguishedName
+                                        IsInherited = $Rule.IsInherited
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
         
@@ -422,6 +483,17 @@ function Get-CreateChildUsers {
         Write-DebugInfo "Error enumerating users on $OuDistinguishedName`: $_"
         return @()
     }
+}
+
+# Common AD object type GUIDs for CreateChild extended rights
+$ADObjectTypes = @{
+    "bf967aba-0de6-11d0-a285-00aa003049e2" = "User"
+    "bf967a86-0de6-11d0-a285-00aa003049e2" = "Computer" 
+    "bf967a9c-0de6-11d0-a285-00aa003049e2" = "Group"
+    "bf967aa5-0de6-11d0-a285-00aa003049e2" = "Organization"
+    "bf967aad-0de6-11d0-a285-00aa003049e2" = "Organizational-Unit"
+    "5cb41ed0-0e4c-11d0-a286-00aa003049e2" = "Contact"
+    "bf967aa8-0de6-11d0-a285-00aa003049e2" = "Organizational-Person"
 }
 
 # Main execution
@@ -519,7 +591,6 @@ try {
         # Display enumeration results
         Write-Host "`n[*] Completed enumeration of $($OuResults.Count) OU(s) in $Domain" -ForegroundColor Cyan
         Write-Host "[!] Note: Results limited to OUs where security descriptors are readable by current user" -ForegroundColor Yellow
-        Write-Host "[!] Additional permissions may exist via: Extended rights, Delegation, or restricted security descriptors" -ForegroundColor Yellow
         
         if ($AllCreateChildUsers.Count -gt 0) {
             Write-Host "`n[+] Found $($AllCreateChildUsers.Count) CreateChild permission(s) across all OUs:" -ForegroundColor Green
