@@ -15,15 +15,6 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from ldap3 import Connection
 
-# Move imports inside main() to allow help to work without dependencies
-# from ldap3 import Server, Connection, NTLM, SUBTREE, ALL
-# from ldap3.core.exceptions import LDAPBindError, LDAPException
-# from impacket.ldap.ldaptypes import (
-#     SR_SECURITY_DESCRIPTOR,
-#     ACCESS_ALLOWED_ACE,
-#     ACCESS_ALLOWED_OBJECT_ACE,
-# )
-
 # -----------------------------------------------------------------------------
 # Active Directory Rights Constants
 # -----------------------------------------------------------------------------
